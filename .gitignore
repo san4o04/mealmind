@@ -19,3 +19,5 @@ build/
 
 # DB / local files
 *.sqlite3
+__pycache__/
+*.pyc
