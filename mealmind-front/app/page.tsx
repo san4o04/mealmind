@@ -70,7 +70,7 @@ type WeekPlanOut = {
 };
 
 // AUTH
-type TokenOut = { access_token: string; token_type?: string; user_id: string };
+type TokenOut = { access_token: string; token_type?: string; user_id?: string };
 type MeOut = { id?: string; email?: string; created_at?: string; user_id?: string };
 
 function isSex(v: unknown): v is Sex {
@@ -98,18 +98,18 @@ export default function Page() {
     return localStorage.getItem("mealmind_token") ?? "";
   });
 
-  // ===== APP STATE =====
+  // debug only
   const [userId, setUserId] = useState<string>(() => {
     if (typeof window === "undefined") return "";
     return localStorage.getItem("mealmind_user_id") ?? "";
   });
 
   useEffect(() => {
-    const savedUid = localStorage.getItem("mealmind_user_id");
-    if (savedUid && savedUid !== userId) setUserId(savedUid);
-
     const savedToken = localStorage.getItem("mealmind_token");
     if (savedToken && savedToken !== token) setToken(savedToken);
+
+    const savedUid = localStorage.getItem("mealmind_user_id");
+    if (savedUid && savedUid !== userId) setUserId(savedUid);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -130,6 +130,8 @@ export default function Page() {
   );
   const [plan, setPlan] = useState<MealPlanOut | null>(null);
   const [week, setWeek] = useState<WeekPlanOut | null>(null);
+  const [weekDays, setWeekDays] = useState<number>(7);
+
   const [status, setStatus] = useState<string>("");
 
   // PRODUCTS
@@ -140,21 +142,34 @@ export default function Page() {
     const res = await fetch(`${API}${path}`, {
       ...init,
       headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(init?.headers ?? {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        "Content-Type": "application/json",
       },
       cache: "no-store",
     });
 
+    const text = await res.text().catch(() => "");
+
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
       throw new Error(`${res.status} ${res.statusText} ${text}`.trim());
     }
 
-    // some endpoints may return empty body
-    const txt = await res.text().catch(() => "");
-    return (txt ? (JSON.parse(txt) as T) : (undefined as T));
+    if (!text) return undefined as T;
+
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`Response is not JSON: ${text.slice(0, 300)}`);
+    }
+  }
+
+  function requireToken(): boolean {
+    if (!token) {
+      setStatus("No token. Please Login/Register first.");
+      return false;
+    }
+    return true;
   }
 
   async function register() {
@@ -168,15 +183,17 @@ export default function Page() {
       setToken(data.access_token);
       localStorage.setItem("mealmind_token", data.access_token);
 
-      setUserId(data.user_id);
-      localStorage.setItem("mealmind_user_id", data.user_id);
+      if (data.user_id) {
+        setUserId(data.user_id);
+        localStorage.setItem("mealmind_user_id", data.user_id);
+      }
 
-      setStatus("Registered ✅ Logged in ✅ user_id saved");
+      setStatus("Registered ✅");
+      await loadProfile();
     } catch (err) {
       setStatus(`Register failed: ${String(err)}`);
     }
   }
-
 
   async function login() {
     setStatus("Logging in...");
@@ -187,18 +204,20 @@ export default function Page() {
       });
 
       if (!data?.access_token) {
-        setStatus("Login failed: no access_token in response");
+        setStatus("Login failed: no access_token");
         return;
       }
 
       setToken(data.access_token);
       localStorage.setItem("mealmind_token", data.access_token);
 
-      setUserId(data.user_id);
-      localStorage.setItem("mealmind_user_id", data.user_id);
+      if (data.user_id) {
+        setUserId(data.user_id);
+        localStorage.setItem("mealmind_user_id", data.user_id);
+      }
 
-      setStatus("Logged in ✅ user_id saved");
-
+      setStatus("Logged in ✅");
+      await loadProfile();
     } catch (err) {
       setStatus(`Login failed: ${String(err)}`);
     }
@@ -207,44 +226,40 @@ export default function Page() {
   function clearToken() {
     setToken("");
     localStorage.removeItem("mealmind_token");
+
+    setProfileLoaded(null);
+    setPlan(null);
+    setWeek(null);
+
     setStatus("Token cleared ✅");
   }
 
   async function me() {
+    if (!requireToken()) return;
+
     setStatus("Loading /me ...");
     try {
       const data = await apiFetch<MeOut>("/api/v1/auth/me");
-      setStatus(`Me ✅ ${data?.email ?? ""}`);
-      // если твой бек отдаёт user_id — сохраним
       const uid = data?.user_id ?? data?.id;
+
       if (uid) {
         setUserId(uid);
         localStorage.setItem("mealmind_user_id", uid);
       }
+
+      setStatus(`Me ✅ ${data?.email ?? ""}`);
     } catch (err) {
       setStatus(`Me failed: ${String(err)}`);
     }
   }
 
-  // ===== PROFILE =====
-  function resetUserId() {
-    localStorage.removeItem("mealmind_user_id");
-    setUserId("");
-    setProfileLoaded(null);
-    setPlan(null);
-    setWeek(null);
-    setStatus("user_id cleared ✅");
-  }
-
+  // ===== PROFILE (/profiles/me) =====
   async function loadProfile() {
-    if (!userId) {
-      setStatus("No user_id. Paste it near user_id field.");
-      return;
-    }
-    setStatus("Loading profile...");
+    if (!requireToken()) return;
 
+    setStatus("Loading profile...");
     try {
-      const data = await apiFetch<ProfileOut>(`/api/v1/profiles/${userId}`);
+      const data = await apiFetch<ProfileOut>("/api/v1/profiles/me");
 
       setProfileLoaded(data);
       setProfile({
@@ -261,43 +276,34 @@ export default function Page() {
 
       setStatus("Profile loaded ✅");
     } catch (err) {
+      const msg = String(err);
+      if (msg.includes("404")) {
+        setProfileLoaded(null);
+        setStatus("Profile not found. Create it 👇");
+        return;
+      }
       setProfileLoaded(null);
-      setStatus(`Load profile failed: ${String(err)}`);
+      setStatus(`Load profile failed: ${msg}`);
     }
   }
 
-  // Автозагрузка профиля когда user_id появился
-  useEffect(() => {
-    if (userId) loadProfile();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId]);
-
   async function saveProfile() {
-    setStatus(profileLoaded ? "Updating profile..." : "Creating profile...");
+    if (!requireToken()) return;
 
+    setStatus(profileLoaded ? "Updating profile..." : "Creating profile...");
     try {
       if (!profileLoaded) {
-        const created = await apiFetch<ProfileOut>("/api/v1/profiles", {
+        const created = await apiFetch<ProfileOut>("/api/v1/profiles/me", {
           method: "POST",
           body: JSON.stringify(profile),
         });
-
         setProfileLoaded(created);
-        setUserId(created.user_id);
-        localStorage.setItem("mealmind_user_id", created.user_id);
-
         setStatus("Profile created ✅");
       } else {
-        if (!userId) {
-          setStatus("No user_id.");
-          return;
-        }
-
-        const updated = await apiFetch<ProfileOut>(`/api/v1/profiles/${userId}`, {
+        const updated = await apiFetch<ProfileOut>("/api/v1/profiles/me", {
           method: "PUT",
           body: JSON.stringify(profile),
         });
-
         setProfileLoaded(updated);
         setStatus("Profile updated ✅");
       }
@@ -306,60 +312,19 @@ export default function Page() {
     }
   }
 
-  // ===== MEAL PLANS =====
-  async function generatePlan() {
-    if (!userId) {
-      setStatus("No user_id.");
-      return;
-    }
-    setStatus("Generating plan...");
+  useEffect(() => {
+    if (token) loadProfile();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
 
-    try {
-      const data = await apiFetch<MealPlanOut>("/api/v1/meal-plans/generate", {
-        method: "POST",
-        body: JSON.stringify({ user_id: userId, plan_date: planDate }),
-      });
-      setPlan(data);
-      setStatus("Meal plan generated ✅");
-    } catch (err) {
-      setStatus(`Generate failed: ${String(err)}`);
-    }
-  }
-
-  async function generateWeek() {
-    if (!userId) {
-      setStatus("No user_id.");
-      return;
-    }
-    setStatus("Generating week plan...");
-
-    try {
-      const data = await apiFetch<WeekPlanOut>("/api/v1/meal-plans/generate-week", {
-        method: "POST",
-        body: JSON.stringify({ user_id: userId, start_date: planDate, days: 7 }),
-      });
-
-      setWeek(data);
-      setStatus("Week plan generated ✅");
-    } catch (err) {
-      setWeek(null);
-      setStatus(`Generate week failed: ${String(err)}`);
-    }
-  }
-
+  // ===== MEAL PLANS (/meal-plans/me...) =====
   async function loadPlanByDate() {
-    if (!userId) {
-      setStatus("No user_id.");
-      return;
-    }
-    setStatus("Loading meal plan...");
+    if (!requireToken()) return;
 
+    setStatus("Loading meal plan...");
     try {
-      const uid = encodeURIComponent(userId);
       const d = encodeURIComponent(planDate);
-      const data = await apiFetch<MealPlanOut>(
-        `/api/v1/meal-plans?user_id=${uid}&date=${d}`
-      );
+      const data = await apiFetch<MealPlanOut>(`/api/v1/meal-plans/me?date=${d}`);
       setPlan(data);
       setStatus("Meal plan loaded ✅");
     } catch (err) {
@@ -367,6 +332,54 @@ export default function Page() {
       setStatus(`Load plan failed: ${String(err)}`);
     }
   }
+
+  async function generatePlan() {
+  if (!requireToken()) return;
+
+  setStatus("Generating plan...");
+  try {
+    setWeek(null);
+
+    const data = await apiFetch<MealPlanOut>("/api/v1/meal-plans/me/generate", {
+      method: "POST",
+      body: JSON.stringify({
+        plan_date: planDate, // YYYY-MM-DD
+      }),
+    });
+
+    setPlan(data);
+    setStatus("Meal plan generated ✅");
+  } catch (err) {
+    setStatus(`Generate failed: ${String(err)}`);
+  }
+}
+
+
+  async function generateWeek() {
+  if (!requireToken()) return;
+
+  setStatus("Generating week plan...");
+  try {
+    setPlan(null);
+
+    const days = Math.max(1, Math.min(14, Number(weekDays) || 7));
+
+    const data = await apiFetch<WeekPlanOut>("/api/v1/meal-plans/me/generate-week", {
+      method: "POST",
+      body: JSON.stringify({
+        start_date: planDate,      // YYYY-MM-DD
+        days,                      // number
+        reuse_existing: true,      // ✅ ВАЖНО (иначе 422)
+      }),
+    });
+
+    setWeek(data);
+    setStatus("Week plan generated ✅");
+  } catch (err) {
+    setWeek(null);
+    setStatus(`Generate week failed: ${String(err)}`);
+  }
+}
 
   // ===== PRODUCTS =====
   async function loadProducts() {
@@ -396,6 +409,9 @@ export default function Page() {
   const filteredProducts = products.filter((p) =>
     p.name.toLowerCase().includes(productQuery.toLowerCase())
   );
+
+  const effectiveUserId =
+    profileLoaded?.user_id || plan?.user_id || week?.user_id || userId || "";
 
   return (
     <div className="min-h-screen bg-white flex items-center justify-center p-6">
@@ -461,58 +477,38 @@ export default function Page() {
           ) : (
             <div className="text-sm text-gray-600 break-all">
               Token saved ✅ (Authorization header enabled)
+              {effectiveUserId ? (
+                <div className="mt-2">
+                  user_id:{" "}
+                  <code className="text-xs bg-gray-100 px-2 py-1 rounded">
+                    {effectiveUserId}
+                  </code>
+                </div>
+              ) : null}
             </div>
           )}
-        </div>
-
-        {/* USER ID */}
-        <div className="flex flex-wrap items-center gap-3">
-          <button
-            className="px-4 py-2 rounded-xl text-white font-semibold bg-[rgb(247,93,247)]"
-            onClick={resetUserId}
-          >
-            Reset user_id
-          </button>
-
-          <button
-            className="px-4 py-2 rounded-xl text-white font-semibold bg-[rgb(247,93,247)]"
-            onClick={loadProfile}
-            disabled={!userId}
-          >
-            Load profile
-          </button>
-
-          <div className="ml-auto flex items-center gap-2">
-            <span className="text-sm text-gray-600">user_id:</span>
-
-            {/* ручной ввод user_id */}
-            <input
-              className="border rounded-xl p-2 text-black w-[340px] max-w-full"
-              placeholder="paste user_id here"
-              value={userId}
-              onChange={(e) => {
-                const v = e.target.value.trim();
-                setUserId(v);
-                localStorage.setItem("mealmind_user_id", v);
-              }}
-            />
-
-            <code className="text-xs bg-gray-100 px-2 py-1 rounded">
-              {userId || "—"}
-            </code>
-          </div>
         </div>
 
         {/* PROFILE */}
         <div className="rounded-2xl p-5 space-y-4 bg-[rgb(247,93,247)] text-white">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold">Profile</h2>
-            <button
-              className="px-4 py-2 rounded-xl text-white font-semibold bg-[rgb(247,93,247)]"
-              onClick={saveProfile}
-            >
-              {profileLoaded ? "Update" : "Create"} profile
-            </button>
+            <div className="flex gap-2">
+              <button
+                className="px-4 py-2 rounded-xl text-white font-semibold bg-[rgb(247,93,247)]"
+                onClick={loadProfile}
+                disabled={!token}
+              >
+                Load
+              </button>
+              <button
+                className="px-4 py-2 rounded-xl text-white font-semibold bg-[rgb(247,93,247)]"
+                onClick={saveProfile}
+                disabled={!token}
+              >
+                {profileLoaded ? "Update" : "Create"} profile
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -666,6 +662,7 @@ export default function Page() {
         <div className="rounded-2xl p-5 space-y-4 bg-[rgb(247,93,247)] text-white">
           <div className="flex flex-wrap items-center gap-3 justify-between">
             <h2 className="text-lg font-semibold">Meal plan</h2>
+
             <div className="flex items-center gap-2">
               <input
                 className="border rounded-xl p-2 text-black"
@@ -673,24 +670,37 @@ export default function Page() {
                 value={planDate}
                 onChange={(e) => setPlanDate(e.target.value)}
               />
+
               <button
                 className="px-4 py-2 rounded-xl text-white font-semibold bg-[rgb(247,93,247)]"
                 onClick={loadPlanByDate}
-                disabled={!userId}
+                disabled={!token}
               >
                 Get
               </button>
+
               <button
                 className="px-4 py-2 rounded-xl text-white font-semibold bg-[rgb(247,93,247)]"
                 onClick={generatePlan}
-                disabled={!userId}
+                disabled={!token}
               >
                 Generate
               </button>
+
+              <input
+                className="border rounded-xl p-2 text-black w-[90px]"
+                type="number"
+                min={1}
+                max={14}
+                value={weekDays}
+                onChange={(e) => setWeekDays(Number(e.target.value))}
+                title="days"
+              />
+
               <button
                 className="px-4 py-2 rounded-xl text-white font-semibold bg-[rgb(247,93,247)]"
                 onClick={generateWeek}
-                disabled={!userId}
+                disabled={!token}
               >
                 Generate week + shopping list
               </button>
@@ -736,6 +746,31 @@ export default function Page() {
           ) : (
             <div className="text-gray-200 text-sm">No meal plan loaded yet.</div>
           )}
+
+          {week ? (
+            <div className="mt-4 space-y-2">
+              <div className="text-sm bg-white/20 rounded-xl px-3 py-2">
+                Week: <b>{week.start_date}</b> → <b>{week.end_date}</b> | kcal:{" "}
+                <b>{week.total_week_kcal}</b> | cost:{" "}
+                <b>{week.total_week_cost_kzt} ₸</b>
+              </div>
+
+              <div className="rounded-xl bg-white text-black p-3">
+                <div className="font-semibold mb-2">Shopping list</div>
+                {week.shopping_list?.length ? (
+                  <ul className="text-sm list-disc pl-6">
+                    {week.shopping_list.map((s) => (
+                      <li key={s.product_id}>
+                        {s.name} — {s.total_grams}g — {s.total_cost_kzt} ₸
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="text-sm text-gray-600">No shopping list</div>
+                )}
+              </div>
+            </div>
+          ) : null}
         </div>
 
         <div className="flex flex-wrap gap-2">

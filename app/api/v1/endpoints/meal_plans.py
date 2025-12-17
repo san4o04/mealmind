@@ -1,11 +1,13 @@
-import uuid
 import datetime as dt
-from fastapi import APIRouter, Depends, HTTPException
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc
 
 from app.infrastructure.session import get_db
-from app.infrastructure.models import Profile, Product, MealPlan, MealPlanItem
+from app.infrastructure.models import User, Profile, Product, MealPlan, MealPlanItem
+from app.auth.deps import get_current_user
 from app.schemas.meal_plans import (
     MealPlanGenerateIn,
     MealPlanOut,
@@ -17,6 +19,9 @@ from app.schemas.meal_plans import (
 
 router = APIRouter(prefix="/meal-plans", tags=["meal-plans"])
 
+# -------------------------
+# helpers
+# -------------------------
 def kcal_for(product: Product, grams: int) -> int:
     return int(round((grams / 100.0) * float(product.kcal_per_100g)))
 
@@ -91,8 +96,6 @@ def top_up_to_target(items: list[dict], target_kcal: int, budget_kzt: int) -> No
             items.append(cheap_item)
         cheap_item["grams"] += 10
 
-
-
 def fit_plan(items: list[dict], target_kcal: int, budget_kzt: int) -> list[dict]:
     if not items:
         return items
@@ -100,10 +103,7 @@ def fit_plan(items: list[dict], target_kcal: int, budget_kzt: int) -> list[dict]
     scale_to_target(items, target_kcal)
     reduce_cost(items, budget_kzt)
     top_up_to_target(items, target_kcal, budget_kzt)
-
     return items
-
-
 
 def calc_target_kcal(profile: Profile) -> int:
     w = float(profile.weight_kg)
@@ -132,20 +132,98 @@ def calc_target_kcal(profile: Profile) -> int:
     target = max(1400, min(3200, target))
     return int(round(target))
 
-
 def get_product_by_name(db: Session, name: str) -> Product | None:
     return db.execute(select(Product).where(Product.name == name)).scalar_one_or_none()
 
 
-@router.post("/generate", response_model=MealPlanOut)
-def generate_meal_plan(payload: MealPlanGenerateIn, db: Session = Depends(get_db)):
-    plan_date = payload.plan_date or dt.date.today()
+def _plan_out_from_meal_plan(db: Session, mp: MealPlan) -> MealPlanOut:
+    rows = db.execute(
+        select(MealPlanItem, Product)
+        .join(Product, MealPlanItem.product_id == Product.id)
+        .where(MealPlanItem.meal_plan_id == mp.id)
+    ).all()
 
+    items_out: list[MealPlanItemOut] = []
+    total_kcal = 0
+    total_cost = 0.0
+
+    for it, prod in rows:
+        items_out.append(
+            MealPlanItemOut(
+                meal_type=it.meal_type,
+                product_id=it.product_id,
+                name=prod.name,
+                grams=it.grams,
+                kcal=it.kcal,
+                cost_kzt=float(it.cost_kzt),
+            )
+        )
+        total_kcal += int(it.kcal)
+        total_cost = round(total_cost + float(it.cost_kzt), 2)
+
+    return MealPlanOut(
+        id=mp.id,
+        user_id=mp.user_id,
+        plan_date=mp.plan_date,
+        target_kcal=mp.target_kcal,
+        total_kcal=total_kcal,
+        total_cost_kzt=float(mp.total_cost_kzt),
+        items=items_out,
+    )
+
+
+def _plan_out_from_db(db: Session, user_id: UUID, date: dt.date) -> MealPlanOut | None:
+    mp = db.execute(
+        select(MealPlan)
+        .where(MealPlan.user_id == user_id, MealPlan.plan_date == date)
+        .order_by(desc(MealPlan.created_at))
+        .limit(1)
+    ).scalar_one_or_none()
+
+    if not mp:
+        return None
+
+    return _plan_out_from_meal_plan(db, mp)
+
+
+def _shopping_from_plans(plans: list[MealPlanOut]) -> tuple[list[ShoppingItemOut], int, float]:
+    agg: dict[str, dict] = {}
+    total_kcal = 0
+    total_cost = 0.0
+
+    for p in plans:
+        for it in p.items:
+            total_kcal += int(it.kcal)
+            total_cost = round(total_cost + float(it.cost_kzt), 2)
+
+            key = str(it.product_id)
+            if key not in agg:
+                agg[key] = {
+                    "product_id": it.product_id,
+                    "name": it.name,
+                    "total_grams": 0,
+                    "total_kcal": 0,
+                    "total_cost_kzt": 0.0,
+                }
+            agg[key]["total_grams"] += int(it.grams)
+            agg[key]["total_kcal"] += int(it.kcal)
+            agg[key]["total_cost_kzt"] = round(agg[key]["total_cost_kzt"] + float(it.cost_kzt), 2)
+
+    shopping = [
+        ShoppingItemOut(**v) for v in sorted(agg.values(), key=lambda x: x["total_cost_kzt"], reverse=True)
+    ]
+    return shopping, total_kcal, total_cost
+
+
+# -------------------------
+# core generator (user_id + date)
+# -------------------------
+def _generate_for_user_and_date(db: Session, user_id: UUID, plan_date: dt.date) -> MealPlanOut:
     profile = db.execute(
-        select(Profile).where(Profile.user_id == payload.user_id)
+        select(Profile).where(Profile.user_id == user_id)
     ).scalar_one_or_none()
     if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found for this user_id")
+        raise HTTPException(status_code=404, detail="Profile not found for this user")
 
     any_product = db.execute(select(Product).limit(1)).scalar_one_or_none()
     if not any_product:
@@ -161,7 +239,6 @@ def generate_meal_plan(payload: MealPlanGenerateIn, db: Session = Depends(get_db
         ("dinner",    [("Lentils (dry)", 80), ("Buckwheat (dry)", 80)]),
     ]
 
-    # 1) соберём raw items
     raw_items: list[dict] = []
     for meal_type, parts in plan_template:
         for prod_name, grams in parts:
@@ -172,10 +249,8 @@ def generate_meal_plan(payload: MealPlanGenerateIn, db: Session = Depends(get_db
     if not raw_items:
         raise HTTPException(status_code=400, detail="Could not build plan: required products not found.")
 
-    # 2) подгоним под target/budget
     raw_items = fit_plan(raw_items, target_kcal=target_kcal, budget_kzt=budget_kzt)
 
-    # 3) сохранить
     items_to_save: list[MealPlanItem] = []
     items_out: list[MealPlanItemOut] = []
     total_kcal = 0
@@ -213,7 +288,7 @@ def generate_meal_plan(payload: MealPlanGenerateIn, db: Session = Depends(get_db
         total_cost = round(total_cost + cost, 2)
 
     meal_plan = MealPlan(
-        user_id=payload.user_id,
+        user_id=user_id,
         plan_date=plan_date,
         target_kcal=target_kcal,
         total_cost_kzt=total_cost,
@@ -238,281 +313,118 @@ def generate_meal_plan(payload: MealPlanGenerateIn, db: Session = Depends(get_db
         items=items_out,
     )
 
-import uuid
 
-@router.get("", response_model=MealPlanOut)
-def get_meal_plan(user_id: uuid.UUID, date: dt.date, db: Session = Depends(get_db)):
+# -------------------------
+# NEW: me-based endpoints (no user_id from client)
+# -------------------------
+@router.post("/me/generate", response_model=MealPlanOut)
+def generate_my_meal_plan(
+    payload: MealPlanGenerateIn,  # будем использовать твою схему, но user_id игнорим
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    plan_date = payload.plan_date or dt.date.today()
+    return _generate_for_user_and_date(db, user_id=current_user.id, plan_date=plan_date)
+
+
+@router.get("/me", response_model=MealPlanOut)
+def get_my_meal_plan(
+    date: dt.date = Query(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    mp = _plan_out_from_db(db, user_id=current_user.id, date=date)
+    if not mp:
+        raise HTTPException(status_code=404, detail="Meal plan not found for this date")
+    return mp
+
+
+@router.get("/me/latest", response_model=MealPlanOut)
+def latest_my_meal_plan(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     mp = db.execute(
         select(MealPlan)
-        .where(MealPlan.user_id == user_id, MealPlan.plan_date == date)
+        .where(MealPlan.user_id == current_user.id)
         .order_by(desc(MealPlan.created_at))
         .limit(1)
     ).scalar_one_or_none()
 
-    if not mp:
-        raise HTTPException(status_code=404, detail="No meal plan for this date")
-
-    rows = db.execute(
-        select(MealPlanItem, Product)
-        .join(Product, MealPlanItem.product_id == Product.id)
-        .where(MealPlanItem.meal_plan_id == mp.id)
-    ).all()
-
-    items_out = []
-    total_kcal = 0
-    total_cost = 0.0
-
-    for it, prod in rows:
-        items_out.append(
-            MealPlanItemOut(
-                meal_type=it.meal_type,
-                product_id=it.product_id,
-                name=prod.name,
-                grams=it.grams,
-                kcal=it.kcal,
-                cost_kzt=float(it.cost_kzt),
-            )
-        )
-        total_kcal += int(it.kcal)
-        total_cost = round(total_cost + float(it.cost_kzt), 2)
-
-    return MealPlanOut(
-        id=mp.id,
-        user_id=mp.user_id,
-        plan_date=mp.plan_date,
-        target_kcal=mp.target_kcal,
-        total_kcal=total_kcal,
-        total_cost_kzt=float(mp.total_cost_kzt),
-        items=items_out,
-    )
-
-
-
-@router.get("/latest", response_model=MealPlanOut)
-def latest_meal_plan(user_id: str, db: Session = Depends(get_db)):
-    mp = db.execute(
-        select(MealPlan).where(MealPlan.user_id == user_id).order_by(desc(MealPlan.created_at)).limit(1)
-    ).scalar_one_or_none()
     if not mp:
         raise HTTPException(status_code=404, detail="No meal plans for this user")
 
-    rows = db.execute(
-        select(MealPlanItem, Product)
-        .join(Product, MealPlanItem.product_id == Product.id)
-        .where(MealPlanItem.meal_plan_id == mp.id)
-    ).all()
+    return _plan_out_from_meal_plan(db, mp)
 
-    items_out = []
-    total_kcal = 0
-    total_cost = 0.0
 
-    for it, prod in rows:
-        items_out.append(
-            MealPlanItemOut(
-                meal_type=it.meal_type,
-                product_id=it.product_id,
-                name=prod.name,
-                grams=it.grams,
-                kcal=it.kcal,
-                cost_kzt=float(it.cost_kzt),
-            )
-        )
-        total_kcal += int(it.kcal)
-        total_cost = round(total_cost + float(it.cost_kzt), 2)
+@router.post("/me/generate-week", response_model=MealPlanWeekOut)
+def generate_my_week(
+    payload: MealPlanWeekGenerateIn,  # используем твою схему, но user_id игнорим
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    start = payload.start_date or dt.date.today()
+    days = max(1, min(14, int(payload.days or 7)))
 
-    return MealPlanOut(
-        id=mp.id,
-        user_id=mp.user_id,
-        plan_date=mp.plan_date,
-        target_kcal=mp.target_kcal,
-        total_kcal=total_kcal,
-        total_cost_kzt=float(mp.total_cost_kzt),
-        items=items_out,
+    plans: list[MealPlanOut] = []
+    for i in range(days):
+        d = start + dt.timedelta(days=i)
+
+        if getattr(payload, "reuse_existing", False):
+            existing = _plan_out_from_db(db, current_user.id, d)
+            if existing:
+                plans.append(existing)
+                continue
+
+        created = _generate_for_user_and_date(db, user_id=current_user.id, plan_date=d)
+        plans.append(created)
+
+    shopping_list, total_week_kcal, total_week_cost = _shopping_from_plans(plans)
+
+    return MealPlanWeekOut(
+        user_id=current_user.id,
+        start_date=start,
+        end_date=start + dt.timedelta(days=days - 1),
+        total_week_kcal=total_week_kcal,
+        total_week_cost_kzt=float(total_week_cost),
+        plans=plans,
+        shopping_list=shopping_list,
     )
+
+
+# -------------------------
+# OPTIONAL: keep old endpoints (backward compatible)
+# -------------------------
+@router.post("/generate", response_model=MealPlanOut)
+def generate_meal_plan(payload: MealPlanGenerateIn, db: Session = Depends(get_db)):
+    plan_date = payload.plan_date or dt.date.today()
+    return _generate_for_user_and_date(db, user_id=payload.user_id, plan_date=plan_date)
+
 
 @router.get("", response_model=MealPlanOut)
-def get_meal_plan(user_id: str, date: dt.date, db: Session = Depends(get_db)):
-    mp = db.execute(
-        select(MealPlan)
-        .where(MealPlan.user_id == user_id)
-        .where(MealPlan.plan_date == date)
-        .order_by(desc(MealPlan.created_at))
-        .limit(1)
-    ).scalar_one_or_none()
-
+def get_meal_plan(user_id: UUID = Query(...), date: dt.date = Query(...), db: Session = Depends(get_db)):
+    mp = _plan_out_from_db(db, user_id=user_id, date=date)
     if not mp:
         raise HTTPException(status_code=404, detail="Meal plan not found for this date")
-
-    # дальше просто reuse логики из /latest (твоя часть rows/items_out)
-    rows = db.execute(
-        select(MealPlanItem, Product)
-        .join(Product, MealPlanItem.product_id == Product.id)
-        .where(MealPlanItem.meal_plan_id == mp.id)
-    ).all()
-
-    items_out = []
-    total_kcal = 0
-    total_cost = 0.0
-    for it, prod in rows:
-        items_out.append(
-            MealPlanItemOut(
-                meal_type=it.meal_type,
-                product_id=it.product_id,
-                name=prod.name,
-                grams=it.grams,
-                kcal=it.kcal,
-                cost_kzt=float(it.cost_kzt),
-            )
-        )
-        total_kcal += int(it.kcal)
-        total_cost = round(total_cost + float(it.cost_kzt), 2)
-
-    return MealPlanOut(
-        id=mp.id,
-        user_id=mp.user_id,
-        plan_date=mp.plan_date,
-        target_kcal=mp.target_kcal,
-        total_kcal=total_kcal,
-        total_cost_kzt=float(mp.total_cost_kzt),
-        items=items_out,
-    )
-
-from fastapi import Query
-
-@router.get("", response_model=MealPlanOut)
-def get_meal_plan(user_id: str = Query(...), date: dt.date = Query(...), db: Session = Depends(get_db)):
-    mp = db.execute(
-        select(MealPlan)
-        .where(MealPlan.user_id == user_id, MealPlan.plan_date == date)
-        .order_by(desc(MealPlan.created_at))
-        .limit(1)
-    ).scalar_one_or_none()
-
-    if not mp:
-        raise HTTPException(status_code=404, detail="Meal plan not found for this date")
-
-    rows = db.execute(
-        select(MealPlanItem, Product)
-        .join(Product, MealPlanItem.product_id == Product.id)
-        .where(MealPlanItem.meal_plan_id == mp.id)
-    ).all()
-
-    items_out = []
-    total_kcal = 0
-    total_cost = 0.0
-    for it, prod in rows:
-        items_out.append(MealPlanItemOut(
-            meal_type=it.meal_type,
-            product_id=it.product_id,
-            name=prod.name,
-            grams=it.grams,
-            kcal=it.kcal,
-            cost_kzt=float(it.cost_kzt),
-        ))
-        total_kcal += int(it.kcal)
-        total_cost = round(total_cost + float(it.cost_kzt), 2)
-
-    return MealPlanOut(
-        id=mp.id,
-        user_id=mp.user_id,
-        plan_date=mp.plan_date,
-        target_kcal=mp.target_kcal,
-        total_kcal=total_kcal,
-        total_cost_kzt=float(mp.total_cost_kzt),
-        items=items_out,
-    )
-def _plan_out_from_db(db: Session, user_id: uuid.UUID, date: dt.date) -> MealPlanOut | None:
-    mp = db.execute(
-        select(MealPlan)
-        .where(MealPlan.user_id == user_id, MealPlan.plan_date == date)
-        .order_by(desc(MealPlan.created_at))
-        .limit(1)
-    ).scalar_one_or_none()
-
-    if not mp:
-        return None
-
-    rows = db.execute(
-        select(MealPlanItem, Product)
-        .join(Product, MealPlanItem.product_id == Product.id)
-        .where(MealPlanItem.meal_plan_id == mp.id)
-    ).all()
-
-    items_out: list[MealPlanItemOut] = []
-    total_kcal = 0
-    total_cost = 0.0
-
-    for it, prod in rows:
-        items_out.append(
-            MealPlanItemOut(
-                meal_type=it.meal_type,
-                product_id=it.product_id,
-                name=prod.name,
-                grams=it.grams,
-                kcal=it.kcal,
-                cost_kzt=float(it.cost_kzt),
-            )
-        )
-        total_kcal += int(it.kcal)
-        total_cost = round(total_cost + float(it.cost_kzt), 2)
-
-    return MealPlanOut(
-        id=mp.id,
-        user_id=mp.user_id,
-        plan_date=mp.plan_date,
-        target_kcal=mp.target_kcal,
-        total_kcal=total_kcal,
-        total_cost_kzt=float(mp.total_cost_kzt),
-        items=items_out,
-    )
-
-
-def _shopping_from_plans(plans: list[MealPlanOut]) -> tuple[list[ShoppingItemOut], int, float]:
-    agg: dict[str, dict] = {}
-    total_kcal = 0
-    total_cost = 0.0
-
-    for p in plans:
-        for it in p.items:
-            total_kcal += int(it.kcal)
-            total_cost = round(total_cost + float(it.cost_kzt), 2)
-
-            key = str(it.product_id)
-            if key not in agg:
-                agg[key] = {
-                    "product_id": it.product_id,
-                    "name": it.name,
-                    "total_grams": 0,
-                    "total_kcal": 0,
-                    "total_cost_kzt": 0.0,
-                }
-            agg[key]["total_grams"] += int(it.grams)
-            agg[key]["total_kcal"] += int(it.kcal)
-            agg[key]["total_cost_kzt"] = round(agg[key]["total_cost_kzt"] + float(it.cost_kzt), 2)
-
-    shopping = [
-        ShoppingItemOut(**v) for v in sorted(agg.values(), key=lambda x: x["total_cost_kzt"], reverse=True)
-    ]
-    return shopping, total_kcal, total_cost
+    return mp
 
 
 @router.post("/generate-week", response_model=MealPlanWeekOut)
 def generate_week(payload: MealPlanWeekGenerateIn, db: Session = Depends(get_db)):
     start = payload.start_date or dt.date.today()
-    days = max(1, min(14, int(payload.days or 7)))  # ограничим, чтобы не улетать в бесконечность
+    days = max(1, min(14, int(payload.days or 7)))
 
     plans: list[MealPlanOut] = []
-
     for i in range(days):
         d = start + dt.timedelta(days=i)
 
-        if payload.reuse_existing:
+        if getattr(payload, "reuse_existing", False):
             existing = _plan_out_from_db(db, payload.user_id, d)
             if existing:
                 plans.append(existing)
                 continue
 
-        created = generate_meal_plan(MealPlanGenerateIn(user_id=payload.user_id, plan_date=d), db)
+        created = _generate_for_user_and_date(db, user_id=payload.user_id, plan_date=d)
         plans.append(created)
 
     shopping_list, total_week_kcal, total_week_cost = _shopping_from_plans(plans)
